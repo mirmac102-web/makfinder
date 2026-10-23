@@ -1,3 +1,2 @@
 aiogram
 requests
-google-generativeai
