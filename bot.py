@@ -3,7 +3,7 @@ import logging
 import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import requests
+import google.generativeai as genai
 from aiogram import Bot, Dispatcher, types
 
 # --- МИНИ-СЕРВЕР ДЛЯ RENDER (чтобы веб-сервис не засыпал) ---
@@ -11,7 +11,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"MAK Bot is active and running!")
+        self.wfile.write(b"MAK Bot with Gemini API is active and running!")
 
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
@@ -21,44 +21,32 @@ def run_web_server():
 # Запускаем веб-сервер в фоновом потоке
 threading.Thread(target=run_web_server, daemon=True).start()
 
-# --- КОД БОТА ---
-TELEGRAM_TOKEN = "8682588496:AAHrYDO95xAjPLdeAByUKPUEGlNUTwKMxOY"
-OPENROUTER_API_KEY = "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"
+# --- НАСТРОЙКА КЛЮЧЕЙ И ИНИЦИАЛИЗАЦИЯ ---
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8682588496:AAHrYDO95xAjPLdeAByUKPUEGlNUTwKMxOY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6IIm-sGh2EiNVCtaofF5m0cOUC7j8yROh81t0Y_SW6baA")
+
+# Настраиваем Google Gemini API
+genai.configure(api_key=GEMINI_API_KEY)
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-# Бесплатные модели OpenRouter с авто-переключением
-FREE_MODELS = [
-    "meta-llama/llama-3-8b-instruct:free",
-    "openrouter/free",
-    "qwen/qwen-2.5-72b-instruct:free"
-]
-
 chat_history = []
 
-# Универсальная функция запроса к ИИ с перебором моделей
-async def ask_openrouter(system_prompt, user_prompt):
-    for model in FREE_MODELS:
-        try:
-            res = requests.post(
-                url="https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ]
-                },
-                timeout=15
-            )
-            if res.status_code == 200:
-                data = res.json()
-                return data['choices'][0]['message']['content']
-        except Exception:
-            continue
-    return "⚠️ Брат, че-то серваки легли или лимиты кончились. Попробуй еще раз чуть позже!"
+# Универсальная функция запроса к Google Gemini API
+async def ask_gemini(system_prompt, user_prompt):
+    try:
+        # Используем быструю и стабильную модель gemini-1.5-flash
+        model = genai.GenerativeModel(
+            model_name="gemini-1.5-flash",
+            system_instruction=system_prompt
+        )
+        
+        # Генерация ответа в отдельном потоке, чтобы не блокировать бота
+        response = await asyncio.to_thread(model.generate_content, user_prompt)
+        return response.text
+    except Exception as e:
+        return f"⚠️ Ошибка Gemini API: {e}"
 
 @dp.message()
 async def handle_messages(message: types.Message):
@@ -81,10 +69,10 @@ async def handle_messages(message: types.Message):
         # --- КОМАНДА: Мак найди ---
         if text_lower.startswith("мак найди"):
             query = text[9:].strip() or "персонажа"
-            status_msg = await message.reply("🔍 МАК сканирует чат и генерирует анкету, бро...")
+            status_msg = await message.reply("🔍 МАК сканирует чат и генерирует анкету через Gemini, бро...")
             
             system_prompt = (
-                "Ты — ИИ-чат-бот по имени МАК (умный бро, весёлый, дружелюбный, общаешься неформально, "
+                "Ты — ИИ-чат-бот по имени Мак (умный бро, весёлый, дружелюбный, общаешься неформально, "
                 "используешь сленг вроде 'бро', 'жесть', 'имба', 'угар', '💀', '🔥', подкалываешь, но даёшь точные ответы). "
                 "Твоя задача — проанализировать историю сообщений чата и составить анкету персонажа/участника "
                 "на основе его активности и текста по строгому шаблону.\n\n"
@@ -128,14 +116,13 @@ async def handle_messages(message: types.Message):
             context_text = "\n".join(chat_history) if chat_history else "Чат пока пуст."
             user_prompt = f"Запрос на поиск/создание: {query}\n\nИстория чата:\n{context_text}"
             
-            res_text = await ask_openrouter(system_prompt, user_prompt)
+            res_text = await ask_gemini(system_prompt, user_prompt)
             await status_msg.edit_text(res_text)
 
         # --- КОМАНДА: Мак проверь ---
         elif text_lower.startswith("мак проверь"):
             query = text[11:].strip()
             
-            # Если пользователь сделал реплай на другое сообщение с анкетой, цепляем его текст
             target_text = query
             if message.reply_to_message and message.reply_to_message.text:
                 target_text += f"\n\nАнкета из сообщения:\n{message.reply_to_message.text}"
@@ -144,7 +131,7 @@ async def handle_messages(message: types.Message):
                 await message.reply("Бро, напиши после «Мак проверь» саму анкету или сделай реплай (ответ) на сообщение с анкетой, которую надо пробить!")
                 return
 
-            status_msg = await message.reply("🧐 МАК проверяет баланс, звезды и косяки...")
+            status_msg = await message.reply("🧐 МАК проверяет баланс через Gemini...")
             
             system_prompt = (
                 "Ты — ИИ-чат-бот МАК (умный бро, эксперт по балансу персонажей и анкет). "
@@ -157,7 +144,7 @@ async def handle_messages(message: types.Message):
             )
             user_prompt = f"Проверь эту анкету:\n{target_text}"
             
-            res_text = await ask_openrouter(system_prompt, user_prompt)
+            res_text = await ask_gemini(system_prompt, user_prompt)
             await status_msg.edit_text(res_text)
 
         # --- ОБЫЧНЫЙ РЕЖИМ ЧАТА (Мак ...) ---
@@ -173,11 +160,13 @@ async def handle_messages(message: types.Message):
                 "Твой девиз: 'Сначала разберёмся, потом сделаем имбу'. 💀🔥"
             )
             
-            res_text = await ask_openrouter(system_prompt, user_query)
+            res_text = await ask_gemini(system_prompt, user_query)
             await message.reply(res_text)
 
 async def main():
     logging.basicConfig(level=logging.INFO)
+    # Принудительно очищаем вебхуки, чтобы polling работал стабильно
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
