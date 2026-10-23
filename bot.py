@@ -30,11 +30,11 @@ dp = Dispatcher()
 
 chat_history = []
 
-# Прямая функция запроса к Google Gemini API
-async def ask_gemini(system_prompt, user_prompt):
+# Универсальная функция запроса к Google Gemini API с выбором модели
+async def ask_gemini(system_prompt, user_prompt, model="gemini-1.5-flash"):
     try:
         clean_key = GEMINI_API_KEY.strip() if GEMINI_API_KEY else ""
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={clean_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={clean_key}"
         
         payload = {
             "system_instruction": {
@@ -50,7 +50,7 @@ async def ask_gemini(system_prompt, user_prompt):
             url,
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=15
+            timeout=20
         )
         
         if res.status_code == 200:
@@ -61,7 +61,6 @@ async def ask_gemini(system_prompt, user_prompt):
             
     except Exception as e:
         return f"⚠️ Ошибка соединения с Gemini: {e}"
-
 
 @dp.message()
 async def handle_messages(message: types.Message):
@@ -81,10 +80,10 @@ async def handle_messages(message: types.Message):
     # 2. Обработка команд, начинающихся с «МакИИ»
     if text_lower.startswith("макии"):
         
-        # --- КОМАНДА: МакИИ найди ---
+        # --- КОМАНДА: МакИИ найди (Использует Gemini 1.5 Pro) ---
         if text_lower.startswith("макии найди"):
             query = text[11:].strip() or "персонажа"
-            status_msg = await message.reply("🔍 МАК сканирует чат и генерирует анкету через Gemini, бро...")
+            status_msg = await message.reply("🔍 МАК сканирует чат и генерирует анкету через Gemini Pro, бро...")
             
             system_prompt = (
                 "Ты — ИИ-чат-бот по имени МАК (умный бро, весёлый, дружелюбный, общаешься неформально, "
@@ -131,10 +130,10 @@ async def handle_messages(message: types.Message):
             context_text = "\n".join(chat_history) if chat_history else "Чат пока пуст."
             user_prompt = f"Запрос на поиск/создание: {query}\n\nИстория чата:\n{context_text}"
             
-            res_text = await ask_gemini(system_prompt, user_prompt)
+            res_text = await ask_gemini(system_prompt, user_prompt, model="gemini-1.5-pro")
             await status_msg.edit_text(res_text)
 
-        # --- КОМАНДА: МакИИ проверь ---
+        # --- КОМАНДА: МакИИ проверь (Использует Gemini 1.5 Pro) ---
         elif text_lower.startswith("макии проверь"):
             query = text[13:].strip()
             
@@ -146,7 +145,7 @@ async def handle_messages(message: types.Message):
                 await message.reply("Бро, напиши после «МакИИ проверь» саму анкету или сделай реплай (ответ) на сообщение с анкетой, которую надо пробить!")
                 return
 
-            status_msg = await message.reply("🧐 МАК проверяет баланс через Gemini...")
+            status_msg = await message.reply("🧐 МАК проверяет баланс через Gemini Pro...")
             
             system_prompt = (
                 "Ты — ИИ-чат-бот МАК (умный бро, эксперт по балансу персонажей и анкет).\n"
@@ -162,10 +161,10 @@ async def handle_messages(message: types.Message):
             )
             user_prompt = f"Проверь эту анкету:\n{target_text}"
             
-            res_text = await ask_gemini(system_prompt, user_prompt)
+            res_text = await ask_gemini(system_prompt, user_prompt, model="gemini-1.5-pro")
             await status_msg.edit_text(res_text)
 
-        # --- ОБЫЧНЫЙ РЕЖИМ ЧАТА (МакИИ ...) ---
+        # --- ОБЫЧНЫЙ РЕЖИМ ЧАТА (Использует Gemini 1.5 Flash) ---
         else:
             user_query = text[5:].strip()
             if not user_query:
@@ -178,7 +177,7 @@ async def handle_messages(message: types.Message):
                 "Твой девиз: 'Сначала разберёмся, потом сделаем имбу'. 💀🔥"
             )
             
-            res_text = await ask_gemini(system_prompt, user_query)
+            res_text = await ask_gemini(system_prompt, user_query, model="gemini-1.5-flash")
             await message.reply(res_text)
 
 async def main():
