@@ -1,380 +1,348 @@
+
 import asyncio
 import logging
 import os
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from collections import defaultdict, deque
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
 import requests
 from aiogram import Bot, Dispatcher, types
+from aiogram.client.default import DefaultBotProperties
 
-# --- МИНИ-СЕРВЕР ДЛЯ RENDER (чтобы веб-сервис не засыпал) ---
-class SimpleHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"MAK Bot with Gemini API is active and running!")
+# ================= НАСТРОЙКИ =================
 
-def run_web_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), SimpleHandler)
-    server.serve_forever()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-# Запускаем веб-сервер в фоновом потоке
-threading.Thread(target=run_web_server, daemon=True).start()
+# Экономичная модель для обычного общения
+CHAT_MODEL = os.getenv(
+    "CHAT_MODEL", "gemini-3.5-flash-lite"
+)
 
-# --- НАСТРОЙКА КЛЮЧЕЙ И ИНИЦИАЛИЗАЦИЯ ---
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# Модель для анкет и проверки баланса
+SMART_MODEL = os.getenv(
+    "SMART_MODEL", "gemini-3.6-flash"
+)
 
-bot = Bot(token=TELEGRAM_TOKEN)
+API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Не задан TELEGRAM_TOKEN")
+
+if not GEMINI_API_KEY:
+    raise RuntimeError("Не задан GEMINI_API_KEY")
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("MAK")
+
+bot = Bot(
+    token=TELEGRAM_TOKEN,
+    default=DefaultBotProperties(parse_mode=None),
+)
 dp = Dispatcher()
 
-chat_history = []
+# История отдельно для каждого чата, максимум 30 сообщений
+chat_history = defaultdict(lambda: deque(maxlen=30))
 
-# Универсальная функция запроса к Google Gemini API с выбором модели
-async def ask_gemini(system_prompt, user_prompt, model="gemini-1.5-flash-latest"):
+
+# ================= WEB-СЕРВЕР =================
+
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"MAK Bot is running!"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+
+def run_web_server():
+    port = int(os.getenv("PORT", "10000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), SimpleHandler)
+    server.serve_forever()
+
+
+threading.Thread(
+    target=run_web_server,
+    daemon=True,
+).start()
+
+
+# ================= GEMINI API =================
+
+async def ask_gemini(system_prompt, user_prompt, model=CHAT_MODEL):
+    url = f"{API_URL}/{model}:generateContent"
+
+    payload = {
+        "system_instruction": {
+            "parts": [{"text": system_prompt}]
+        },
+        "contents": [{
+            "role": "user",
+            "parts": [{"text": user_prompt}]
+        }],
+        "generationConfig": {
+            "temperature": 0.8,
+            "maxOutputTokens": 1800,
+        },
+    }
+
     try:
-        clean_key = GEMINI_API_KEY.strip() if GEMINI_API_KEY else ""
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={clean_key}"
-        
-        payload = {
-            "system_instruction": {
-                "parts": [{"text": system_prompt}]
-            },
-            "contents": [{
-                "parts": [{"text": user_prompt}]
-            }]
-        }
-        
-        res = await asyncio.to_thread(
+        response = await asyncio.to_thread(
             requests.post,
             url,
+            params={"key": GEMINI_API_KEY},
             json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=20
+            timeout=45,
         )
-        
-        if res.status_code == 200:
-            data = res.json()
-            return data['candidates'][0]['content']['parts'][0]['text']
+
+        if response.status_code != 200:
+            log.error(
+                "Gemini API error: %s %s",
+                response.status_code,
+                response.text[:1000],
+            )
+
+            if response.status_code == 429:
+                return "Бро, упёрлись в лимит Gemini 💀 Подожди немного и попробуй ещё раз."
+
+            if response.status_code in (401, 403):
+                return "Бро, Gemini отклонил доступ. Проверь API-ключ и доступ к модели."
+
+            if response.status_code == 404:
+                return (
+                    f"Модель {model} не найдена или недоступна "
+                    "для этого проекта. Проверь её в Google AI Studio."
+                )
+
+            return f"Ошибка Gemini API: HTTP {response.status_code}"
+
+        data = response.json()
+        candidates = data.get("candidates", [])
+
+        if not candidates:
+            feedback = data.get("promptFeedback", {})
+            log.warning("Gemini returned no candidates: %s", feedback)
+            return "Бро, Gemini не выдал ответ. Попробуй переформулировать запрос."
+
+        candidate = candidates[0]
+        parts = candidate.get("content", {}).get("parts", [])
+        answer = "\n".join(
+            part["text"]
+            for part in parts
+            if "text" in part
+        ).strip()
+
+        if not answer:
+            return "Бро, Gemini вернул пустой ответ. Попробуй ещё раз."
+
+        return answer
+
+    except requests.Timeout:
+        return "Бро, Gemini слишком долго отвечает. Попробуй ещё раз."
+    except requests.RequestException:
+        log.exception("Gemini connection error")
+        return "Бро, не удалось подключиться к Gemini."
+    except (ValueError, KeyError, TypeError):
+        log.exception("Invalid Gemini response")
+        return "Бро, пришёл ответ неожиданного формата от Gemini."
+
+
+# ================= ОТПРАВКА ОТВЕТОВ =================
+
+async def send_long_message(message, text):
+    # Лимит Telegram — 4096 символов на сообщение.
+    # Разбиваем чуть раньше, стараясь сохранить абзацы.
+    while text:
+        if len(text) <= 4000:
+            chunk, text = text, ""
         else:
-            return f"⚠️ Ошибка Gemini ({res.status_code}): {res.text}"
-            
-    except Exception as e:
-        return f"⚠️ Ошибка соединения с Gemini: {e}"
+            split_at = text.rfind("\n", 0, 4000)
+            if split_at < 1000:
+                split_at = 4000
+            chunk, text = text[:split_at], text[split_at:].lstrip()
+
+        await message.answer(chunk)
+
+
+# ================= ПРОМПТЫ =================
+
+MAK_PERSONA = (
+    "Ты МАК — умный, весёлый и дружелюбный бро. "
+    "Общайся по-русски, неформально, используй уместный сленг, "
+    "юмор и эмодзи. Отвечай точно. Девиз: "
+    "'Сначала разберёмся, потом сделаем имбу'."
+)
+
+CHARACTER_PROMPT = MAK_PERSONA + """
+Создай анкету персонажа для Dandy's World RP.
+Учитывай историю чата, если она передана. Не выдумывай
+реальные факты об участниках без оснований.
+
+Правила:
+1. Кто вы: любое существо, тун или монстр.
+2. Возраст и адекватный рост обязательны.
+3. Характер соответствует описанию или общению.
+4. Друзей указывай только если есть основания.
+5. Выбери тип: Тун, Мейн или Летальный.
+6. Сумма пяти характеристик без ХП:
+   Тун — строго 15 звёзд;
+   Мейн — строго 16 звёзд;
+   Летальный — строго 16 звёзд.
+7. Скилл чек, скорость, выносливость, скрытность,
+   экстракт: каждая характеристика от 1 до 5 звёзд.
+8. ХП — от 1 до 4 сердец.
+9. КД способности: Тун 60–100 сек.;
+   Мейн 80–200 сек. Для Летального предложи разумный КД.
+10. Выносливость: 1 звезда = 100 стамины;
+    каждая следующая звезда добавляет 25% от 100;
+    5 звёзд = 200 стамины.
+11. Способность должна быть интересной, но не всемогущей.
+
+Проверь сумму звёзд перед выдачей анкеты.
+
+Формат:
+🔥 АНКЕТА ПЕРСОНАЖА ОТ МАКа 🔥
+👤 Имя / Кто вы:
+🎂 Возраст:
+📏 Рост:
+🎭 Характер:
+🤝 Друзья / С кем ладит:
+🏷️ Тип:
+⚡ Способность / Пассивка: (КД: ... сек)
+📊 Характеристики (Всего звёзд: X/15 или X/16):
+- ❤️ ХП: X/4 сердца
+- 🎯 Скилл чек: X/5
+- ⚡ Скорость: X/5
+- 🏃 Выносливость: X/5 (X стамины)
+- 👤 Скрытность: X/5
+- 🛠️ Скорость экстракта: X/5
+🎨 Внешность туна:
+💬 Комментарий МАКа:
+"""
+
+CHECK_PROMPT = MAK_PERSONA + """
+Ты эксперт по балансу анкет Dandy's World RP.
+
+Проверь присланную анкету:
+1. Сложи только пять характеристик в звёздах:
+   скилл чек + скорость + выносливость +
+   скрытность + скорость экстракта.
+2. Тун — ровно 15 звёзд; Мейн и Летальный —
+   ровно 16 звёзд.
+3. Каждая из пяти характеристик должна быть от 1 до 5.
+4. ХП — от 1 до 4 сердец. ХП не входит в сумму звёзд.
+5. КД: Тун 60–100 сек.; Мейн 80–200 сек.
+6. Проверь рост, стамину и соответствие способности роли.
+7. Не считай отсутствующую информацию автоматически ошибкой:
+   отметь её как неизвестную.
+8. Не выдумывай нарушения. Покажи арифметику суммы.
+
+Если нарушений нет, обязательно напиши:
+«Красавчик все по красоте, правда это анкетолога то спроси)»
+
+Общайся с юмором и иронией, но проверяй математику внимательно.
+"""
+
+
+# ================= ОБРАБОТКА СООБЩЕНИЙ =================
 
 @dp.message()
 async def handle_messages(message: types.Message):
-    global chat_history
-    
-    text = message.text or ""
-    text_lower = text.lower()
+    text = (message.text or "").strip()
 
-    # 1. Если сообщение обычное (не начинается с «макии») — сохраняем в историю чата
-    if text and not text_lower.startswith("макии"):
-        author = message.from_user.first_name or "Участник"
-        chat_history.append(f"{author}: {text}")
-        if len(chat_history) > 60:
-            chat_history.pop(0)
+    if not text or not message.from_user:
         return
 
-    # 2. Обработка команд, начинающихся с «МакИИ»
-    if text_lower.startswith("макии"):
-        
-        # --- КОМАНДА: МакИИ найди (Использует Gemini 1.5 Pro) ---
-        if text_lower.startswith("макии найди"):
-            query = text[11:].strip() or "персонажа"
-            status_msg = await message.reply("🔍 МАК сканирует чат и генерирует анкету через Gemini Pro, бро...")
-            
-            system_prompt = (
-                "Ты — ИИ-чат-бот по имени МАК (умный бро, весёлый, дружелюбный, общаешься неформально, "
-                "используешь сленг вроде 'бро', 'жесть', 'имба', 'угар', '💀', '🔥', подкалываешь, но даёшь точные ответы). "
-                "Твоя задача — проанализировать историю сообщений чата и составить анкету персонажа/участника "
-                "на основе его активности и текста по строгому шаблону.\n\n"
-                "ПРАВИЛА И ОГРАНИЧЕНИЯ ДЛЯ АНКЕТЫ:\n"
-                "1. Кто вы: любое существо / тун / монстр.\n"
-                "2. Возраст: любой.\n"
-                "3. Рост: обязателен (адекватный, 'не как ебаное здание').\n"
-                "4. Характер: любой на основе общения в чате.\n"
-                "5. Каноничные друзья: указать, с кем из участников чата или персонажей ладит.\n"
-                "6. Роль и Способности (выбери одну роль: Тун, Мейн или Летальный):\n"
-                "   - ТУН: баланс, КД абилок 60–100 сек. Суммарный лимит характеристик = строго 15 звёзд!\n"
-                "   - МЕЙН: сильные способки, КД абилок 80–200 сек. Суммарный лимит характеристик = строго 16 звёзд!\n"
-                "   - ЛЕТАЛЬНЫЙ: очень сильные способки (но не имба уровня бога/полубога, не рушит пол-полки). Суммарный лимит = строго 16 звёзд!\n"
-                "7. Статистика (распредели звёзды в рамках лимита ролей 15 или 16!):\n"
-                "   - ❤️ ХП: от 1 до 4 сердец.\n"
-                "   - 🎯 Скилл чек: от 1 до 5 ★\n"
-                "   - ⚡ Скорость: от 1 до 5 ★\n"
-                "   - 🏃 Выносливость: от 1 до 5 ★ (1★ = 100 стамины, каждая +★ даёт +25% стамины, 5★ = 200 стамины)\n"
-                "   - 👤 Скрытность: от 1 до 5 ★\n"
-                "   - 🛠️ Экстракт: от 1 до 5 ★\n"
-                "8. Внешность: описать внешность туна.\n\n"
-                "ОФОРМЛЕНИЕ АНКЕТЫ:\n"
-                "🔥 **АНКЕТА ПЕРСОНАЖА ОТ МАКa** 🔥\n"
-                "👤 **Имя / Кто вы:** ...\n"
-                "🎂 **Возраст:** ...\n"
-                "📏 **Рост:** ...\n"
-                "🎭 **Характер:** ...\n"
-                "🤝 **Друзья / С кем ладит:** ...\n"
-                "🏷️ **Тип:** [Тун / Мейн / Летальный]\n"
-                "⚡ **Способность / Пассивка:** ... (КД: ... сек)\n"
-                "📊 **Характеристики (Всего звёзд: X/15 или X/16):**\n"
-                "- ❤️ ХП: [X/4 сердец]\n"
-                "- 🎯 Скилл чек: [X/5 ★]\n"
-                "- ⚡ Скорость: [X/5 ★]\n"
-                "- 🏃 Выносливость: [X/5 ★] (... стамины)\n"
-                "- 👤 Скрытность: [X/5 ★]\n"
-                "- 🛠️ Скорость экстракта: [X/5 ★]\n"
-                "🎨 **Внешность туна:** ...\n"
-                "💬 **Комментарий МАКa:** (пару слов в стиле бро)"
-            )
-            context_text = "\n".join(chat_history) if chat_history else "Чат пока пуст."
-            user_prompt = f"Запрос на поиск/создание: {query}\n\nИстория чата:\n{context_text}"
-            
-            res_text = await ask_gemini(system_prompt, user_prompt, model="gemini-1.5-pro-latest")
-            await status_msg.edit_text(res_text)
+    text_lower = text.lower()
+    chat_id = message.chat.id
+    author = message.from_user.first_name or "Участник"
 
-        # --- КОМАНДА: МакИИ проверь (Использует Gemini 1.5 Pro) ---
-        elif text_lower.startswith("макии проверь"):
-            query = text[13:].strip()
-            
-            target_text = query
-            if message.reply_to_message and message.reply_to_message.text:
-                target_text += f"\n\nАнкета из сообщения:\n{message.reply_to_message.text}"
+    # Обычные сообщения только сохраняются для контекста.
+    if not text_lower.startswith("макии"):
+        chat_history[chat_id].append(f"{author}: {text[:1500]}")
+        return
 
-            if not target_text:
-                await message.reply("Бро, напиши после «МакИИ проверь» саму анкету или сделай реплай (ответ) на сообщение с анкетой, которую надо пробить!")
-                return
+    # Убираем триггер "макии" и пробелы.
+    command = text[5:].strip()
+    command_lower = command.lower()
 
-            status_msg = await message.reply("🧐 МАК проверяет баланс через Gemini Pro...")
-            
-            system_prompt = (
-                "Ты — ИИ-чат-бот МАК (умный бро, эксперт по балансу персонажей и анкет).\n"
-                "Твоя задача — проверить присланную анкету на ошибки и баланс:\n"
-                "1. Проверь лимит звёзд: для Туна строго максимум 15 звёзд, для Мейна и Летального — строго максимум 16 звёзд. "
-                "Суммируй звёзды (Скилл чек + Скорость + Выносливость + Скрытность + Экстракт). Если больше — разнеси за перебор!\n"
-                "2. Проверь КД способностей: Тун — 60–100 сек, Мейн — 80–200 сек.\n"
-                "3. Проверь ХП (максимум 4 сердца) и рост (не должен быть 'как ебаное здание').\n\n"
-                "ВАЖНОЕ ПРАВИЛО ВЕРДИКТА:\n"
-                "Если в анкете НЕТ ошибок и всё сделано по правилам и балансу, обязательно включи в ответ фразу:\n"
-                "«Красавчик все по красоте, правда это анкетолога то спроси)»\n\n"
-                "Общайся в стиле крутого бро: указывай на ошибки с юмором, сленгом и иронией, а если всё идеал — хвали этой фразой!"
-            )
-            user_prompt = f"Проверь эту анкету:\n{target_text}"
-            
-            res_text = await ask_gemini(system_prompt, user_prompt, model="gemini-1.5-pro-latest")
-            await status_msg.edit_text(res_text)
+    if command_lower.startswith("найди"):
+        query = command[5:].strip() or "придумай персонажа"
 
-        # --- ОБЫЧНЫЙ РЕЖИМ ЧАТА (Использует Gemini 1.5 Flash) ---
-        else:
-            user_query = text[5:].strip()
-            if not user_query:
-                user_query = "Йо, бро, ты тут?"
+        history = "\n".join(chat_history[chat_id])
+        if len(history) > 8000:
+            history = history[-8000:]
 
-            system_prompt = (
-                "Ты — ИИ-чат-бот по имени МАК. Твой характер: дружелюбный, живой, умный ИИ, общаешься как близкий бро. "
-                "Можешь угорать, использовать сленг ('бро', 'йо', 'жесть', 'имба', 'угар'), CAPS для эмоций ('БРООО', 'ЧЕГО 💀'), "
-                "эмодзи, шутки и иронию. Давай точные и умные ответы, помогай с идеями, не будь занудным корпоративным ассистентом. "
-                "Твой девиз: 'Сначала разберёмся, потом сделаем имбу'. 💀🔥"
-            )
-            
-            res_text = await ask_gemini(system_prompt, user_query, model="gemini-1.5-flash-latest")
-            await message.reply(res_text)
-
-async def main():
-    logging.basicConfig(level=logging.INFO)
-    # Принудительно очищаем вебхуки, чтобы polling работал стабильно
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
-import asyncio
-import logging
-import os
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import requests
-from aiogram import Bot, Dispatcher, types
-
-# --- МИНИ-СЕРВЕР ДЛЯ RENDER (чтобы веб-сервис не засыпал) ---
-class SimpleHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"MAK Bot with Gemini API is active and running!")
-
-def run_web_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), SimpleHandler)
-    server.serve_forever()
-
-# Запускаем веб-сервер в фоновом потоке
-threading.Thread(target=run_web_server, daemon=True).start()
-
-# --- НАСТРОЙКА КЛЮЧЕЙ И ИНИЦИАЛИЗАЦИЯ ---
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher()
-
-chat_history = []
-
-# Универсальная функция запроса к Google Gemini API с выбором модели
-async def ask_gemini(system_prompt, user_prompt, model="gemini-1.5-flash"):
-    try:
-        clean_key = GEMINI_API_KEY.strip() if GEMINI_API_KEY else ""
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={clean_key}"
-        
-        payload = {
-            "system_instruction": {
-                "parts": [{"text": system_prompt}]
-            },
-            "contents": [{
-                "parts": [{"text": user_prompt}]
-            }]
-        }
-        
-        res = await asyncio.to_thread(
-            requests.post,
-            url,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=20
+        prompt = (
+            f"Запрос: {query[:2000]}\n\n"
+            f"История чата:\n{history or 'Чат пока пуст.'}"
         )
-        
-        if res.status_code == 200:
-            data = res.json()
-            return data['candidates'][0]['content']['parts'][0]['text']
-        else:
-            return f"⚠️ Ошибка Gemini ({res.status_code}): {res.text}"
-            
-    except Exception as e:
-        return f"⚠️ Ошибка соединения с Gemini: {e}"
 
-@dp.message()
-async def handle_messages(message: types.Message):
-    global chat_history
-    
-    text = message.text or ""
-    text_lower = text.lower()
+        status = await message.reply("🔍 МАК собирает анкету, бро...")
+        result = await ask_gemini(
+            CHARACTER_PROMPT,
+            prompt,
+            SMART_MODEL,
+        )
 
-    # 1. Если сообщение обычное (не начинается с «макии») — сохраняем в историю чата
-    if text and not text_lower.startswith("макии"):
-        author = message.from_user.first_name or "Участник"
-        chat_history.append(f"{author}: {text}")
-        if len(chat_history) > 60:
-            chat_history.pop(0)
+        await status.delete()
+        await send_long_message(message, result)
         return
 
-    # 2. Обработка команд, начинающихся с «МакИИ»
-    if text_lower.startswith("макии"):
-        
-        # --- КОМАНДА: МакИИ найди (Использует Gemini 1.5 Pro) ---
-        if text_lower.startswith("макии найди"):
-            query = text[11:].strip() or "персонажа"
-            status_msg = await message.reply("🔍 МАК сканирует чат и генерирует анкету через Gemini Pro, бро...")
-            
-            system_prompt = (
-                "Ты — ИИ-чат-бот по имени МАК (умный бро, весёлый, дружелюбный, общаешься неформально, "
-                "используешь сленг вроде 'бро', 'жесть', 'имба', 'угар', '💀', '🔥', подкалываешь, но даёшь точные ответы). "
-                "Твоя задача — проанализировать историю сообщений чата и составить анкету персонажа/участника "
-                "на основе его активности и текста по строгому шаблону.\n\n"
-                "ПРАВИЛА И ОГРАНИЧЕНИЯ ДЛЯ АНКЕТЫ:\n"
-                "1. Кто вы: любое существо / тун / монстр.\n"
-                "2. Возраст: любой.\n"
-                "3. Рост: обязателен (адекватный, 'не как ебаное здание').\n"
-                "4. Характер: любой на основе общения в чате.\n"
-                "5. Каноничные друзья: указать, с кем из участников чата или персонажей ладит.\n"
-                "6. Роль и Способности (выбери одну роль: Тун, Мейн или Летальный):\n"
-                "   - ТУН: баланс, КД абилок 60–100 сек. Суммарный лимит характеристик = строго 15 звёзд!\n"
-                "   - МЕЙН: сильные способки, КД абилок 80–200 сек. Суммарный лимит характеристик = строго 16 звёзд!\n"
-                "   - ЛЕТАЛЬНЫЙ: очень сильные способки (но не имба уровня бога/полубога, не рушит пол-полки). Суммарный лимит = строго 16 звёзд!\n"
-                "7. Статистика (распредели звёзды в рамках лимита ролей 15 или 16!):\n"
-                "   - ❤️ ХП: от 1 до 4 сердец.\n"
-                "   - 🎯 Скилл чек: от 1 до 5 ★\n"
-                "   - ⚡ Скорость: от 1 до 5 ★\n"
-                "   - 🏃 Выносливость: от 1 до 5 ★ (1★ = 100 стамины, каждая +★ даёт +25% стамины, 5★ = 200 стамины)\n"
-                "   - 👤 Скрытность: от 1 до 5 ★\n"
-                "   - 🛠️ Экстракт: от 1 до 5 ★\n"
-                "8. Внешность: описать внешность туна.\n\n"
-                "ОФОРМЛЕНИЕ АНКЕТЫ:\n"
-                "🔥 **АНКЕТА ПЕРСОНАЖА ОТ МАКa** 🔥\n"
-                "👤 **Имя / Кто вы:** ...\n"
-                "🎂 **Возраст:** ...\n"
-                "📏 **Рост:** ...\n"
-                "🎭 **Характер:** ...\n"
-                "🤝 **Друзья / С кем ладит:** ...\n"
-                "🏷️ **Тип:** [Тун / Мейн / Летальный]\n"
-                "⚡ **Способность / Пассивка:** ... (КД: ... сек)\n"
-                "📊 **Характеристики (Всего звёзд: X/15 или X/16):**\n"
-                "- ❤️ ХП: [X/4 сердец]\n"
-                "- 🎯 Скилл чек: [X/5 ★]\n"
-                "- ⚡ Скорость: [X/5 ★]\n"
-                "- 🏃 Выносливость: [X/5 ★] (... стамины)\n"
-                "- 👤 Скрытность: [X/5 ★]\n"
-                "- 🛠️ Скорость экстракта: [X/5 ★]\n"
-                "🎨 **Внешность туна:** ...\n"
-                "💬 **Комментарий МАКa:** (пару слов в стиле бро)"
+    if command_lower.startswith("проверь"):
+        query = command[7:].strip()
+
+        if message.reply_to_message:
+            replied_text = message.reply_to_message.text or ""
+            if replied_text:
+                query = f"{query}\n\nАнкета из сообщения:\n{replied_text}"
+
+        if not query:
+            await message.reply(
+                "Бро, напиши анкету после «МакИИ проверь» "
+                "или ответь реплаем на сообщение с анкетой!"
             )
-            context_text = "\n".join(chat_history) if chat_history else "Чат пока пуст."
-            user_prompt = f"Запрос на поиск/создание: {query}\n\nИстория чата:\n{context_text}"
-            
-            res_text = await ask_gemini(system_prompt, user_prompt, model="gemini-1.5-pro")
-            await status_msg.edit_text(res_text)
+            return
 
-        # --- КОМАНДА: МакИИ проверь (Использует Gemini 1.5 Pro) ---
-        elif text_lower.startswith("макии проверь"):
-            query = text[13:].strip()
-            
-            target_text = query
-            if message.reply_to_message and message.reply_to_message.text:
-                target_text += f"\n\nАнкета из сообщения:\n{message.reply_to_message.text}"
+        status = await message.reply("🧐 МАК проверяет баланс...")
+        result = await ask_gemini(
+            CHECK_PROMPT,
+            query[:12000],
+            SMART_MODEL,
+        )
 
-            if not target_text:
-                await message.reply("Бро, напиши после «МакИИ проверь» саму анкету или сделай реплай (ответ) на сообщение с анкетой, которую надо пробить!")
-                return
+        await status.delete()
+        await send_long_message(message, result)
+        return
 
-            status_msg = await message.reply("🧐 МАК проверяет баланс через Gemini Pro...")
-            
-            system_prompt = (
-                "Ты — ИИ-чат-бот МАК (умный бро, эксперт по балансу персонажей и анкет).\n"
-                "Твоя задача — проверить присланную анкету на ошибки и баланс:\n"
-                "1. Проверь лимит звёзд: для Туна строго максимум 15 звёзд, для Мейна и Летального — строго максимум 16 звёзд. "
-                "Суммируй звёзды (Скилл чек + Скорость + Выносливость + Скрытность + Экстракт). Если больше — разнеси за перебор!\n"
-                "2. Проверь КД способностей: Тун — 60–100 сек, Мейн — 80–200 сек.\n"
-                "3. Проверь ХП (максимум 4 сердца) и рост (не должен быть 'как ебаное здание').\n\n"
-                "ВАЖНОЕ ПРАВИЛО ВЕРДИКТА:\n"
-                "Если в анкете НЕТ ошибок и всё сделано по правилам и балансу, обязательно включи в ответ фразу:\n"
-                "«Красавчик все по красоте, правда это анкетолога то спроси)»\n\n"
-                "Общайся в стиле крутого бро: указывай на ошибки с юмором, сленгом и иронией, а если всё идеал — хвали этой фразой!"
-            )
-            user_prompt = f"Проверь эту анкету:\n{target_text}"
-            
-            res_text = await ask_gemini(system_prompt, user_prompt, model="gemini-1.5-pro")
-            await status_msg.edit_text(res_text)
+    user_query = command or "Йо, бро, ты тут?"
 
-        # --- ОБЫЧНЫЙ РЕЖИМ ЧАТА (Использует Gemini 1.5 Flash) ---
-        else:
-            user_query = text[5:].strip()
-            if not user_query:
-                user_query = "Йо, бро, ты тут?"
+    result = await ask_gemini(
+        MAK_PERSONA,
+        user_query[:8000],
+        CHAT_MODEL,
+    )
 
-            system_prompt = (
-                "Ты — ИИ-чат-бот по имени МАК. Твой характер: дружелюбный, живой, умный ИИ, общаешься как близкий бро. "
-                "Можешь угорать, использовать сленг ('бро', 'йо', 'жесть', 'имба', 'угар'), CAPS для эмоций ('БРООО', 'ЧЕГО 💀'), "
-                "эмодзи, шутки и иронию. Давай точные и умные ответы, помогай с идеями, не будь занудным корпоративным ассистентом. "
-                "Твой девиз: 'Сначала разберёмся, потом сделаем имбу'. 💀🔥"
-            )
-            
-            res_text = await ask_gemini(system_prompt, user_query, model="gemini-1.5-flash")
-            await message.reply(res_text)
+    await send_long_message(message, result)
+
 
 async def main():
-    logging.basicConfig(level=logging.INFO)
-    # Принудительно очищаем вебхуки, чтобы polling работал стабильно
+    log.info("Starting MAK bot")
+
+    # Удаляем старый webhook для polling.
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
