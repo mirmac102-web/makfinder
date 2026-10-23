@@ -22,11 +22,13 @@ def run_web_server():
 threading.Thread(target=run_web_server, daemon=True).start()
 
 # --- НАСТРОЙКА КЛЮЧЕЙ И ИНИЦИАЛИЗАЦИЯ ---
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8682588496:AAHrYDO95xAjPLdeAByUKPUEGlNUTwKMxOY")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6IIm-sGh2EiNVCtaofF5m0cOUC7j8yROh81t0Y_SW6baA")
+# Чтение ключей из переменных окружения Render
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Настраиваем Google Gemini API
+# Настройка Google Gemini API
 genai.configure(api_key=GEMINI_API_KEY)
+
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
