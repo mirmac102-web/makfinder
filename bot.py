@@ -33,7 +33,12 @@ chat_history = []
 # Прямая функция запроса к Google Gemini API
 async def ask_gemini(system_prompt, user_prompt):
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+        
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY.strip() if GEMINI_API_KEY else ""
+        }
         
         payload = {
             "system_instruction": {
@@ -48,7 +53,7 @@ async def ask_gemini(system_prompt, user_prompt):
             requests.post,
             url,
             json=payload,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             timeout=15
         )
         
