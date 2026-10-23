@@ -3,7 +3,7 @@ import logging
 import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import google.generativeai as genai
+import requests
 from aiogram import Bot, Dispatcher, types
 
 # --- МИНИ-СЕРВЕР ДЛЯ RENDER (чтобы веб-сервис не засыпал) ---
@@ -22,33 +22,44 @@ def run_web_server():
 threading.Thread(target=run_web_server, daemon=True).start()
 
 # --- НАСТРОЙКА КЛЮЧЕЙ И ИНИЦИАЛИЗАЦИЯ ---
-# Чтение ключей из переменных окружения Render
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-# Настройка Google Gemini API
-genai.configure(api_key=GEMINI_API_KEY)
-
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
 chat_history = []
 
-# Универсальная функция запроса к Google Gemini API
+# Прямая функция запроса к Google Gemini API
 async def ask_gemini(system_prompt, user_prompt):
     try:
-        # Используем быструю и стабильную модель gemini-1.5-flash
-        model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
-            system_instruction=system_prompt
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        
+        payload = {
+            "system_instruction": {
+                "parts": [{"text": system_prompt}]
+            },
+            "contents": [{
+                "parts": [{"text": user_prompt}]
+            }]
+        }
+        
+        res = await asyncio.to_thread(
+            requests.post,
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=15
         )
         
-        # Генерация ответа в отдельном потоке, чтобы не блокировать бота
-        response = await asyncio.to_thread(model.generate_content, user_prompt)
-        return response.text
+        if res.status_code == 200:
+            data = res.json()
+            return data['candidates'][0]['content']['parts'][0]['text']
+        else:
+            return f"⚠️ Ошибка Gemini ({res.status_code}): {res.text}"
+            
     except Exception as e:
-        return f"⚠️ Ошибка Gemini API: {e}"
+        return f"⚠️ Ошибка соединения с Gemini: {e}"
 
 @dp.message()
 async def handle_messages(message: types.Message):
@@ -57,24 +68,24 @@ async def handle_messages(message: types.Message):
     text = message.text or ""
     text_lower = text.lower()
 
-    # 1. Если сообщение обычное (не от МАКа и не команда) — сохраняем в историю чата
-    if text and not text_lower.startswith("мак"):
+    # 1. Если сообщение обычное (не начинается с «макии») — сохраняем в историю чата
+    if text and not text_lower.startswith("макии"):
         author = message.from_user.first_name or "Участник"
         chat_history.append(f"{author}: {text}")
         if len(chat_history) > 60:
             chat_history.pop(0)
         return
 
-    # 2. Обработка команд, начинающихся с «Мак»
-    if text_lower.startswith("мак"):
+    # 2. Обработка команд, начинающихся с «МакИИ»
+    if text_lower.startswith("макии"):
         
-        # --- КОМАНДА: Мак найди ---
-        if text_lower.startswith("мак найди"):
-            query = text[9:].strip() or "персонажа"
+        # --- КОМАНДА: МакИИ найди ---
+        if text_lower.startswith("макии найди"):
+            query = text[11:].strip() or "персонажа"
             status_msg = await message.reply("🔍 МАК сканирует чат и генерирует анкету через Gemini, бро...")
             
             system_prompt = (
-                "Ты — ИИ-чат-бот по имени Мак (умный бро, весёлый, дружелюбный, общаешься неформально, "
+                "Ты — ИИ-чат-бот по имени МАК (умный бро, весёлый, дружелюбный, общаешься неформально, "
                 "используешь сленг вроде 'бро', 'жесть', 'имба', 'угар', '💀', '🔥', подкалываешь, но даёшь точные ответы). "
                 "Твоя задача — проанализировать историю сообщений чата и составить анкету персонажа/участника "
                 "на основе его активности и текста по строгому шаблону.\n\n"
@@ -121,37 +132,40 @@ async def handle_messages(message: types.Message):
             res_text = await ask_gemini(system_prompt, user_prompt)
             await status_msg.edit_text(res_text)
 
-        # --- КОМАНДА: Мак проверь ---
-        elif text_lower.startswith("мак проверь"):
-            query = text[11:].strip()
+        # --- КОМАНДА: МакИИ проверь ---
+        elif text_lower.startswith("макии проверь"):
+            query = text[13:].strip()
             
             target_text = query
             if message.reply_to_message and message.reply_to_message.text:
                 target_text += f"\n\nАнкета из сообщения:\n{message.reply_to_message.text}"
 
             if not target_text:
-                await message.reply("Бро, напиши после «Мак проверь» саму анкету или сделай реплай (ответ) на сообщение с анкетой, которую надо пробить!")
+                await message.reply("Бро, напиши после «МакИИ проверь» саму анкету или сделай реплай (ответ) на сообщение с анкетой, которую надо пробить!")
                 return
 
             status_msg = await message.reply("🧐 МАК проверяет баланс через Gemini...")
             
             system_prompt = (
-                "Ты — ИИ-чат-бот МАК (умный бро, эксперт по балансу персонажей и анкет). "
+                "Ты — ИИ-чат-бот МАК (умный бро, эксперт по балансу персонажей и анкет).\n"
                 "Твоя задача — проверить присланную анкету на ошибки и баланс:\n"
                 "1. Проверь лимит звёзд: для Туна строго максимум 15 звёзд, для Мейна и Летального — строго максимум 16 звёзд. "
                 "Суммируй звёзды (Скилл чек + Скорость + Выносливость + Скрытность + Экстракт). Если больше — разнеси за перебор!\n"
                 "2. Проверь КД способностей: Тун — 60–100 сек, Мейн — 80–200 сек.\n"
-                "3. Проверь ХП (максимум 4 сердца) и рост (не должен быть 'как ебаное здание').\n"
-                "Общайся в стиле крутого бро: указывай на ошибки с юмором, сленгом и иронией, хвали за имбу или критикуй за дисбаланс."
+                "3. Проверь ХП (максимум 4 сердца) и рост (не должен быть 'как ебаное здание').\n\n"
+                "ВАЖНОЕ ПРАВИЛО ВЕРДИКТА:\n"
+                "Если в анкете НЕТ ошибок и всё сделано по правилам и балансу, обязательно включи в ответ фразу:\n"
+                "«Красавчик все по красоте, правда это анкетолога то спроси)»\n\n"
+                "Общайся в стиле крутого бро: указывай на ошибки с юмором, сленгом и иронией, а если всё идеал — хвали этой фразой!"
             )
             user_prompt = f"Проверь эту анкету:\n{target_text}"
             
             res_text = await ask_gemini(system_prompt, user_prompt)
             await status_msg.edit_text(res_text)
 
-        # --- ОБЫЧНЫЙ РЕЖИМ ЧАТА (Мак ...) ---
+        # --- ОБЫЧНЫЙ РЕЖИМ ЧАТА (МакИИ ...) ---
         else:
-            user_query = text[3:].strip()
+            user_query = text[5:].strip()
             if not user_query:
                 user_query = "Йо, бро, ты тут?"
 
