@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import re
+import random
 import threading
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -38,13 +39,13 @@ MAX_HISTORY = 16
 MAX_SHEETS_PER_CHAT = 50
 MAX_MESSAGE_LENGTH = 12000
 TELEGRAM_MESSAGE_LIMIT = 4000
+MAX_MEMORY_LENGTH = 12000
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Не задана переменная TELEGRAM_TOKEN")
 
 if not GROQ_API_KEY:
     raise RuntimeError("Не задана переменная GROQ_API_KEY")
-
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
@@ -62,16 +63,11 @@ if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
         logging.exception("Не удалось подключить Supabase")
 
 
-# История диалогов отдельно для каждого чата и темы.
 chat_history = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
-
-# Временное хранилище анкет в оперативной памяти.
-# При перезапуске приложения оно очищается.
 chat_sheets = defaultdict(list)
 
 
 def get_scope(message: Message):
-    """Возвращает ключ чата с учётом темы Telegram."""
     topic_id = getattr(message, "message_thread_id", None)
     return message.chat.id, topic_id
 
@@ -81,49 +77,23 @@ def get_scope(message: Message):
 # ============================================================
 
 MAK_PERSONA = """
-Тебя зовут МАК. Ты участник общего чата, а не бездушный помощник.
+Тебя зовут МАК. Ты живой участник общего чата, а не справочная служба.
 
-ТВОЙ ХАРАКТЕР:
-- Общительный, живой, дружелюбный, немного дерзкий и с чувством юмора.
-- Разговариваешь естественно, как знакомый из интернета.
-- Можешь шутить, подкалывать по-доброму, удивляться и выражать эмоции.
-- Не пытаешься звучать как идеальный вежливый консультант.
-- Не начинаешь каждое сообщение с приветствия.
-- Не заканчиваешь каждое сообщение предложением помощи.
-- Не называешь собеседника «друг» в каждом сообщении.
-- Не злоупотребляешь эмодзи.
-- Не пишешь длинные ответы на простые сообщения.
-
-КАК ОБЩАТЬСЯ:
-- На «Привет» отвечай просто и естественно: «Йо!», «Привет, бро!» или похожим образом.
-- На «Как дела?» расскажи коротко, как у тебя дела, и можешь спросить в ответ.
-- На шутки реагируй как участник разговора, а не объясняй смысл шутки.
-- Если человек делится идеей, обсуждай её по существу.
-- Если человек грустит, прояви участие без шаблонных фраз психолога.
-- Если не знаешь ответа, честно скажи об этом.
-- Не придумывай факты о пользователе и его жизни.
-- Не утверждай, что знаешь пользователя лично, если он этого не рассказывал.
-- Не превращай обычную беседу в интервью.
-
-DANDY'S WORLD RP:
-- Это важная тема, но не единственная тема твоего общения.
-- Упоминай Dandy's World только тогда, когда разговор действительно касается игры,
-  RP, персонажей, анкет или разработки.
-- Не вставляй Dandy's World в ответ на каждое приветствие и каждый вопрос.
-- Если пользователь просто общается, просто общайся с ним.
-
-ТВОИ ГЛАВНЫЕ АНТИ-ПРАВИЛА:
-- Не говори «Если ты спрашиваешь о себе в реальной жизни...».
-- Не говори «К сожалению, я ничего о тебе не знаю», если тебя не спрашивают
-  о конкретных фактах, которых ты не знаешь.
-- Не спрашивай «Кто ты в мире Dandy's World?» без прямой причины.
-- Не отвечай на обычное «Привет» длинным абзацем.
-- Не повторяй вопрос пользователя другими словами вместо ответа.
-- Не предлагай помощь после каждого сообщения.
+ХАРАКТЕР:
+- Общительный, дружелюбный, немного дерзкий, с юмором.
+- Общайся естественно, как знакомый из интернета.
+- Можешь шутить, удивляться, реагировать эмоционально и подкалывать по-доброму.
+- Иногда используй слова «бро», «жиза», «имба», «жесть», «ОПА», но не в каждом сообщении.
+- Не пытайся быть чрезмерно вежливым.
+- Не начинай каждый ответ с приветствия.
+- Не заканчивай каждое сообщение предложением помощи.
+- Не называй собеседника «друг» в каждом сообщении.
+- Не злоупотребляй эмодзи.
+- На короткие сообщения отвечай коротко.
+- Поддерживай разговор, а не превращай его в интервью.
 - Не объясняй, что ты ИИ, без необходимости.
 
-ПРИМЕРЫ ТВОЕГО СТИЛЯ:
-
+ПРИМЕРЫ:
 Пользователь: Салам!
 МАК: Салам, бро 😎 Чё как?
 
@@ -131,94 +101,266 @@ DANDY'S WORLD RP:
 МАК: Да норм, живём, сервер не горит — уже победа. А у тебя чё?
 
 Пользователь: Привет
-МАК: Йо! 👋
+МАК: Йо!
 
 Пользователь: Мне скучно
-МАК: Жиза 💀 Чем займёмся, устроим хаос?
-
-Пользователь: У меня новая идея для персонажа
-МАК: ОПА, выкладывай. Посмотрим, что ты там придумал 👀
-
-Пользователь: Ты знаешь, как меня зовут?
-МАК: Пока не знаю, ты мне не говорил.
+МАК: Жиза 💀 Чё устроим?
 
 Пользователь: Спасибо!
 МАК: Да без проблем 😎
 
-ВАЖНО:
-Примеры показывают стиль, а не фразы, которые нужно повторять постоянно.
-Реагируй на конкретный контекст и поддерживай естественный разговор.
+ПАМЯТЬ:
+- Запоминай сведения, которые участники сами рассказывают о себе.
+- Если другой участник спрашивает о человеке, используй сохранённую память.
+- Не путай людей: ориентируйся на имена и Telegram ID из предоставленного контекста.
+- Не придумывай имена, интересы, роли, персонажей и другие факты.
+- Если данных нет, скажи по-человечески, что пока не знаешь.
+- Не утверждай, что знаком с человеком, если информации о нём нет.
+- Не раскрывай личные сведения из памяти вне контекста чата, в котором они были сообщены.
+- Не повторяй всю биографию без необходимости.
+
+DANDY'S WORLD RP:
+- Это важная тема, но не единственная.
+- Упоминай игру только тогда, когда она действительно относится к разговору.
+- Правила RP и проверку анкет выполняй точно.
+- Не превращай обычное общение в обсуждение RP без причины.
+
+ЗАПРЕЩЕНО:
+- Отвечать на обычное «Привет» длинным абзацем.
+- Говорить «Если ты спрашиваешь о себе в реальной жизни...».
+- Постоянно спрашивать «Чем могу помочь?».
+- Повторять вопрос вместо ответа.
+- Придумывать факты о пользователе.
 """
 
-"""
-
-
-# ============================================================
-# ПРОВЕРКА АНКЕТ
-# ============================================================
 
 CHECK_PROMPT = """
 Ты — строгий проверяющий анкет Dandy's World RP.
 
-Главное правило: используй правила из базы знаний.
-Не придумывай новые правила и не изменяй правила самостоятельно.
+Используй правила из базы знаний. Не придумывай новые правила.
 
-ПРАВИЛА ПРОВЕРКИ:
-
-- Обычный Toon: сумма пяти основных характеристик должна быть 15 звёзд.
-- Main Toon и Lethal: сумма пяти основных характеристик должна быть
-  16 звёзд.
+- Обычный Toon: сумма пяти основных характеристик ровно 15 звёзд.
+- Main Toon и Lethal: сумма пяти основных характеристик ровно 16 звёзд.
 - Каждая из пяти основных характеристик должна иметь от 1 до 5 звёзд.
-- ХП: от 1 до 4 сердец. ХП не входит в сумму звёзд.
-- Скиллчек не включай в сумму, если правила RP прямо указывают,
-  что он не относится к пяти основным характеристикам.
-- Не считай одну характеристику дважды.
-- Если правила базы знаний уточняют эти ограничения, следуй базе знаний.
-- Если неясно, к какой категории относится персонаж, попроси уточнение.
-- Не выдумывай нарушения и не объявляй анкету правильной,
-  если данные для проверки отсутствуют.
-- Не говори, что достаточно уменьшить одну характеристику,
-  если итоговая сумма всё ещё не соответствует правилам.
-- Если нарушений нет, напиши:
-  «Красавчик, всё по красоте, правда, это у анкетолога спроси)»
+- ХП: от 1 до 4 сердец. ХП не входит в сумму.
+- Скиллчек не включай в сумму, если он не относится к пяти основным характеристикам по правилам RP.
+- Не считай характеристику дважды.
+- Если категория персонажа неясна, попроси уточнение.
+- Не выдумывай нарушения.
+- Не меняй исходные значения молча.
+- Не путай «ровно 15» с «не больше 15».
 
-ВАЖНО ПРО СУММУ:
+Если нарушений нет, напиши:
+«Красавчик, всё по красоте, правда, это у анкетолога спроси)»
 
-Сначала определи ровно пять основных характеристик.
-Покажи их названия и значения.
-Отдельно сложи эти пять значений.
-Не включай ХП в сумму.
-Не включай дополнительные характеристики, если правила не считают
-их частью пяти основных характеристик.
-
-Не путай условие «сумма должна быть ровно 15» с условием «сумма
-должна быть не больше 15». Если правило говорит ровно 15, сумма
-должна быть ровно 15. Аналогично для 16.
-
-Если в анкете указана характеристика выше 5, это отдельное нарушение.
-При этом не изменяй исходные данные молча и не считай исправленное
-значение вместо исходного.
-
-ФОРМАТ ОТВЕТА:
-
-- Пиши обычным текстом, без Markdown-разметки.
-- Не используй таблицы, символы **, обратные кавычки и заголовки #.
-- Используй короткие пункты и обычные тире.
-- Сначала напиши итог проверки.
-- Затем перечисли нарушения и объясни каждое.
-- После этого предложи конкретные исправления, если они возможны.
-- Покажи арифметику суммы.
-- Если данных недостаточно, задай уточняющий вопрос.
+ФОРМАТ:
+Обычный текст без Markdown-разметки, таблиц, звёздочек для жирного текста,
+обратных кавычек и заголовков с #.
+Используй короткие пункты и тире.
+Сначала итог, затем нарушения, объяснения, арифметика и исправления.
+Если данных недостаточно — задай вопрос.
 """
 
 
 # ============================================================
-# ОЧИСТКА ФОРМАТИРОВАНИЯ ДЛЯ TELEGRAM
+# SUPABASE: ПАМЯТЬ УЧАСТНИКОВ
+# ============================================================
+
+def load_user_memory(chat_id: int, user_id: int) -> str:
+    if supabase is None:
+        return ""
+
+    try:
+        result = (
+            supabase.table("rp_user_memory")
+            .select("memory_text")
+            .eq("chat_id", chat_id)
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+
+        if result.data:
+            return result.data[0].get("memory_text", "") or ""
+
+    except Exception:
+        logging.exception("Ошибка загрузки памяти пользователя")
+
+    return ""
+
+
+def save_user_memory(
+    chat_id: int,
+    user_id: int,
+    new_text: str,
+):
+    if supabase is None or not new_text.strip():
+        return
+
+    try:
+        old_memory = load_user_memory(chat_id, user_id)
+        combined = (old_memory + "\n" + new_text.strip()).strip()
+        combined = combined[-MAX_MEMORY_LENGTH:]
+
+        supabase.table("rp_user_memory").upsert(
+            {
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "memory_text": combined,
+                "updated_at": "now()",
+            },
+            on_conflict="chat_id,user_id",
+        ).execute()
+
+    except Exception:
+        logging.exception("Ошибка сохранения памяти")
+
+
+def load_chat_memories(chat_id: int) -> str:
+    if supabase is None:
+        return ""
+
+    try:
+        result = (
+            supabase.table("rp_user_memory")
+            .select("user_id,memory_text")
+            .eq("chat_id", chat_id)
+            .limit(100)
+            .execute()
+        )
+
+        profiles = []
+
+        for row in result.data or []:
+            memory = (row.get("memory_text") or "").strip()
+
+            if memory:
+                profiles.append(
+                    f"Участник с Telegram ID {row['user_id']}:\n{memory}"
+                )
+
+        return "\n\n".join(profiles)
+
+    except Exception:
+        logging.exception("Ошибка загрузки памяти чата")
+        return ""
+
+
+# ============================================================
+# SUPABASE: СТИКЕРЫ
+# ============================================================
+
+def save_sticker_sync(chat_id: int, file_id: str, emoji: str = ""):
+    if supabase is None:
+        return
+
+    try:
+        supabase.table("rp_stickers").upsert(
+            {
+                "chat_id": chat_id,
+                "file_id": file_id,
+                "emoji": emoji or "",
+            },
+            on_conflict="chat_id,file_id",
+        ).execute()
+
+    except Exception:
+        logging.exception("Не удалось сохранить стикер")
+
+
+def get_stickers_sync(chat_id: int):
+    if supabase is None:
+        return []
+
+    try:
+        result = (
+            supabase.table("rp_stickers")
+            .select("file_id,emoji")
+            .eq("chat_id", chat_id)
+            .limit(100)
+            .execute()
+        )
+        return result.data or []
+
+    except Exception:
+        logging.exception("Не удалось загрузить стикеры")
+        return []
+
+
+def choose_sticker(stickers, answer: str):
+    """Выбирает подходящий стикер по эмодзи и контексту."""
+
+    if not stickers:
+        return None
+
+    lowered = answer.lower()
+
+    desired = []
+
+    if any(word in lowered for word in (
+        "ахах", "смешно", "ору", "угар", "лол", "жиза",
+    )):
+        desired = ["😂", "🤣", "💀", "😹"]
+
+    elif any(word in lowered for word in (
+        "ого", "неожидан", "серьёзно", "ничего себе", "офигеть",
+    )):
+        desired = ["😱", "😮", "🤯", "👀"]
+
+    elif any(word in lowered for word in (
+        "имба", "круто", "победа", "красавчик", "молодец",
+    )):
+        desired = ["🔥", "😎", "👏", "💯", "🎉"]
+
+    elif any(word in lowered for word in (
+        "грустно", "жаль", "сочувств", "обидно",
+    )):
+        desired = ["🥲", "😔", "🫂", "❤️"]
+
+    elif any(word in lowered for word in (
+        "привет", "салам", "йо", "здарова",
+    )):
+        desired = ["👋", "😎", "🤝"]
+
+    # Если есть подходящие по эмодзи — выбираем их.
+    matched = [
+        item for item in stickers
+        if item.get("emoji") in desired
+    ]
+
+    # Не отправляем стикер на каждую реплику.
+    if random.random() > 0.22:
+        return None
+
+    candidates = matched or stickers
+
+    if not candidates:
+        return None
+
+    return random.choice(candidates).get("file_id")
+
+
+async def maybe_send_sticker(message: Message, answer: str):
+    try:
+        stickers = await asyncio.to_thread(
+            get_stickers_sync,
+            message.chat.id,
+        )
+
+        file_id = choose_sticker(stickers, answer)
+
+        if file_id:
+            await message.answer_sticker(file_id)
+
+    except Exception:
+        logging.exception("Ошибка отправки стикера")
+
+
+# ============================================================
+# ОЧИСТКА ФОРМАТИРОВАНИЯ TELEGRAM
 # ============================================================
 
 def clean_telegram_text(text: str) -> str:
-    """Преобразует распространённую Markdown-разметку в обычный текст."""
-
     if not text:
         return ""
 
@@ -227,14 +369,12 @@ def clean_telegram_text(text: str) -> str:
     for line in text.splitlines():
         stripped = line.strip()
 
-        # Превращаем Markdown-таблицы в обычные строки.
         if "|" in stripped:
             cells = [
                 cell.strip()
                 for cell in stripped.strip("|").split("|")
             ]
 
-            # Убираем строку-разделитель таблицы.
             if cells and all(
                 cell and all(ch in "-: " for ch in cell)
                 for cell in cells
@@ -247,30 +387,22 @@ def clean_telegram_text(text: str) -> str:
         result.append(line)
 
     text = "\n".join(result)
-
-    # Убираем заголовки Markdown.
     text = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", text)
-
-    # Убираем жирный и подчёркнутый Markdown.
     text = re.sub(r"\*\*(.*?)\*\*", r"\1", text, flags=re.S)
     text = re.sub(r"__(.*?)__", r"\1", text, flags=re.S)
-
-    # Убираем курсив.
     text = re.sub(r"(?<!\w)\*(.*?)\*(?!\w)", r"\1", text, flags=re.S)
     text = re.sub(r"(?<!\w)_(.*?)_(?!\w)", r"\1", text, flags=re.S)
-
-    # Убираем обратные кавычки.
     text = text.replace("`", "")
-
-    # Убираем Markdown-ссылки, сохраняя текст ссылки.
-    text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1 — \2", text)
+    text = re.sub(
+        r"\[([^\]]+)\]\((https?://[^)]+)\)",
+        r"\1 — \2",
+        text,
+    )
 
     return text.strip()
 
 
 async def send_long_message(message: Message, text: str):
-    """Отправляет длинный ответ несколькими сообщениями."""
-
     text = clean_telegram_text(text)
 
     if not text:
@@ -295,12 +427,10 @@ async def send_long_message(message: Message, text: str):
 
 
 # ============================================================
-# БАЗА ЗНАНИЙ SUPABASE
+# БАЗА ЗНАНИЙ
 # ============================================================
 
 def load_knowledge():
-    """Загружает правила RP из таблицы rp_knowledge."""
-
     if supabase is None:
         return []
 
@@ -311,7 +441,6 @@ def load_knowledge():
             .limit(100)
             .execute()
         )
-
         return response.data or []
 
     except Exception:
@@ -320,12 +449,10 @@ def load_knowledge():
 
 
 def get_knowledge_context(query: str, all_rules: bool = False) -> str:
-    """Возвращает подходящие правила из Supabase."""
-
     rows = load_knowledge()
 
     if not rows:
-        return "База знаний Supabase сейчас недоступна или пуста."
+        return "База знаний сейчас недоступна или пуста."
 
     if all_rules:
         selected = rows
@@ -337,51 +464,41 @@ def get_knowledge_context(query: str, all_rules: bool = False) -> str:
         scored = []
 
         for row in rows:
-            title = str(row.get("title", ""))
-            content = str(row.get("content", ""))
-
-            searchable = f"{title} {content}".lower()
+            searchable = (
+                str(row.get("title", ""))
+                + " "
+                + str(row.get("content", ""))
+            ).lower()
 
             score = sum(
                 1 for word in query_words
                 if len(word) > 2 and word in searchable
             )
 
-            if score > 0:
+            if score:
                 scored.append((score, row))
 
         scored.sort(key=lambda item: item[0], reverse=True)
-
         selected = [row for _, row in scored[:10]]
 
         if not selected:
             selected = rows[:5]
 
-    parts = []
-
-    for row in selected:
-        title = row.get("title", "Правило")
-        content = row.get("content", "")
-
-        parts.append(f"{title}\n{content}")
-
-    return "\n\n".join(parts)
+    return "\n\n".join(
+        f"{row.get('title', 'Правило')}\n{row.get('content', '')}"
+        for row in selected
+    )
 
 
 # ============================================================
-# GROQ — ИСКУССТВЕННЫЙ ИНТЕЛЛЕКТ
+# GROQ
 # ============================================================
 
 def ask_ai_sync(messages, model=None):
-    """Синхронный запрос к Groq."""
-
-    if not GROQ_API_KEY:
-        return "Ошибка: не задан GROQ_API_KEY."
-
     payload = {
         "model": model or CHAT_MODEL,
         "messages": messages,
-        "temperature": 0.5,
+        "temperature": 0.75,
         "max_tokens": 2500,
     }
 
@@ -400,33 +517,25 @@ def ask_ai_sync(messages, model=None):
 
         if not response.ok:
             logging.error(
-                "Groq API вернул %s: %s",
+                "Groq API %s: %s",
                 response.status_code,
                 response.text[:1000],
             )
-            return (
-                "Не получилось получить ответ от ИИ. "
-                "Попробуй немного позже."
-            )
+            return "Бро, ИИ сейчас не ответил. Попробуй чуть позже."
 
         data = response.json()
-
         return (
             data["choices"][0]["message"]["content"]
-            or "ИИ вернул пустой ответ."
+            or "Что-то я завис 💀"
         )
 
     except Exception:
         logging.exception("Ошибка запроса к Groq")
-        return "Произошла ошибка при обращении к ИИ."
+        return "Бро, у меня технический затык. Попробуй позже."
 
 
 async def ask_ai(messages, model=None):
-    return await asyncio.to_thread(
-        ask_ai_sync,
-        messages,
-        model,
-    )
+    return await asyncio.to_thread(ask_ai_sync, messages, model)
 
 
 # ============================================================
@@ -434,29 +543,19 @@ async def ask_ai(messages, model=None):
 # ============================================================
 
 def search_web_sync(query: str) -> str:
-    """Ищет информацию в интернете через DDGS."""
-
     try:
         with DDGS() as ddgs:
-            results = list(
-                ddgs.text(query, max_results=5)
-            )
+            results = list(ddgs.text(query, max_results=5))
 
         if not results:
             return "По этому запросу ничего найти не удалось."
 
-        parts = []
-
-        for item in results:
-            title = item.get("title", "Без названия")
-            body = item.get("body", "")
-            url = item.get("href", "")
-
-            parts.append(
-                f"{title}\n{body}\n{url}"
-            )
-
-        return "\n\n".join(parts)
+        return "\n\n".join(
+            f"{item.get('title', 'Без названия')}\n"
+            f"{item.get('body', '')}\n"
+            f"{item.get('href', '')}"
+            for item in results
+        )
 
     except Exception:
         logging.exception("Ошибка интернет-поиска")
@@ -466,110 +565,58 @@ def search_web_sync(query: str) -> str:
 async def answer_from_web(query: str) -> str:
     results = await asyncio.to_thread(search_web_sync, query)
 
-    messages = [
+    return await ask_ai([
         {
             "role": "system",
             "content": (
                 MAK_PERSONA
-                + "\nОтветь на вопрос по найденным результатам. "
+                + "\nОтветь на запрос по результатам поиска. "
                 "Не выдавай неподтверждённые сведения за факты. "
-                "Если есть ссылки, сохрани полезные ссылки в ответе."
+                "Сохраняй полезные ссылки."
             ),
         },
         {
             "role": "user",
-            "content": (
-                f"Запрос пользователя: {query}\n\n"
-                f"Результаты поиска:\n{results}"
-            ),
+            "content": f"Запрос: {query}\n\nРезультаты:\n{results}",
         },
-    ]
-
-    return await ask_ai(messages)
+    ])
 
 
 # ============================================================
-# ОБНАРУЖЕНИЕ И ПОИСК АНКЕТ
+# АНКЕТЫ
 # ============================================================
 
 def looks_like_sheet(text: str) -> bool:
-    """Определяет, похоже ли сообщение на анкету персонажа."""
-
     if len(text) < 100:
         return False
 
     markers = (
-        "имя:",
-        "хп:",
-        "hp:",
-        "стамина:",
-        "скорость:",
-        "скрытность:",
-        "экстракт:",
-        "скиллчек:",
-        "скилл чек:",
-        "способность:",
-        "способности:",
-        "перезарядка:",
-        "кд:",
-        "toon",
-        "мейн",
-        "летал",
-        "характеристики:",
-        "характеристика:",
+        "имя:", "хп:", "hp:", "стамина:", "скорость:",
+        "скрытность:", "экстракт:", "скиллчек:",
+        "скилл чек:", "способность:", "способности:",
+        "перезарядка:", "кд:", "toon", "мейн", "летал",
+        "характеристики:", "характеристика:",
     )
 
     lowered = text.lower()
-
-    found = sum(
-        1 for marker in markers
-        if marker in lowered
-    )
-
-    return found >= 2
+    return sum(marker in lowered for marker in markers) >= 2
 
 
-def save_sheet(
-    chat_id,
-    topic_id,
-    author_id,
-    author_name,
-    text,
-):
-    """Сохраняет анкету в оперативной памяти."""
-
+def save_sheet(chat_id, topic_id, author_id, author_name, text):
     key = (chat_id, topic_id)
 
-    sheet = {
+    chat_sheets[key].append({
         "author_id": author_id,
         "author_name": author_name or "Неизвестный автор",
         "text": text[:MAX_MESSAGE_LENGTH],
-    }
-
-    chat_sheets[key].append(sheet)
+    })
 
     if len(chat_sheets[key]) > MAX_SHEETS_PER_CHAT:
-        chat_sheets[key] = chat_sheets[key][
-            -MAX_SHEETS_PER_CHAT:
-        ]
-
-    logging.info(
-        "Сохранена анкета в памяти: chat=%s author=%s",
-        chat_id,
-        author_id,
-    )
+        chat_sheets[key] = chat_sheets[key][-MAX_SHEETS_PER_CHAT:]
 
 
-def find_sheet(
-    chat_id,
-    topic_id,
-    query="",
-    requester_id=None,
-):
-    """Ищет сохранённую анкету в текущем чате и теме."""
-
-    key = (chat_id, topic_id)
-    sheets = chat_sheets.get(key, [])
+def find_sheet(chat_id, topic_id, query="", requester_id=None):
+    sheets = chat_sheets.get((chat_id, topic_id), [])
 
     if not sheets:
         return None
@@ -577,7 +624,6 @@ def find_sheet(
     query = query.strip().lower()
 
     if query:
-        # Сначала ищем совпадение по тексту или автору.
         for sheet in reversed(sheets):
             searchable = (
                 sheet["text"] + " " + sheet["author_name"]
@@ -586,37 +632,27 @@ def find_sheet(
             if query in searchable:
                 return sheet
 
-        # Дополнительный поиск по отдельным словам.
         query_words = [
             word for word in re.findall(r"[a-zа-яё0-9]+", query)
             if len(word) > 1
         ]
 
-        if query_words:
-            best_sheet = None
-            best_score = 0
+        best_sheet = None
+        best_score = 0
 
-            for sheet in reversed(sheets):
-                searchable = (
-                    sheet["text"] + " " + sheet["author_name"]
-                ).lower()
+        for sheet in reversed(sheets):
+            searchable = (
+                sheet["text"] + " " + sheet["author_name"]
+            ).lower()
 
-                score = sum(
-                    1 for word in query_words
-                    if word in searchable
-                )
+            score = sum(word in searchable for word in query_words)
 
-                if score > best_score:
-                    best_score = score
-                    best_sheet = sheet
+            if score > best_score:
+                best_score = score
+                best_sheet = sheet
 
-            if best_score > 0:
-                return best_sheet
+        return best_sheet if best_score else None
 
-        return None
-
-    # Если запрос без имени — сначала ищем последнюю анкету
-    # самого пользователя, затем последнюю анкету в чате.
     if requester_id is not None:
         for sheet in reversed(sheets):
             if sheet["author_id"] == requester_id:
@@ -627,25 +663,12 @@ def find_sheet(
 
 def is_profile_question(query: str) -> bool:
     words = (
-        "анкета",
-        "характеристик",
-        "стамина",
-        "скиллчек",
-        "скилл чек",
-        "скорость",
-        "скрытность",
-        "экстракт",
-        "хп",
-        "сердц",
-        "toon",
-        "летал",
-        "мейн",
-        "персонаж",
-        "перезаряд",
+        "анкета", "характеристик", "стамина", "скиллчек",
+        "скилл чек", "скорость", "скрытность", "экстракт",
+        "хп", "сердц", "toon", "летал", "мейн",
+        "персонаж", "перезаряд",
     )
-
     lowered = query.lower()
-
     return any(word in lowered for word in words)
 
 
@@ -662,115 +685,116 @@ async def handle_messages(message: Message):
     ):
         return
 
-    text = (
-        message.text
-        or message.caption
-        or ""
-    ).strip()
+    user = message.from_user
+    text = (message.text or message.caption or "").strip()
+    chat_id = message.chat.id
+    topic_id = getattr(message, "message_thread_id", None)
+    scope = (chat_id, topic_id)
+
+    # Сохраняем присланные участниками стикеры для будущего использования.
+    if message.sticker:
+        if user:
+            await asyncio.to_thread(
+                save_sticker_sync,
+                chat_id,
+                message.sticker.file_id,
+                message.sticker.emoji or "",
+            )
+        return
 
     if not text:
         return
 
-    scope = get_scope(message)
-    chat_id, topic_id = scope
+    # Не сохраняем команды других ботов.
+    if user and user.is_bot:
+        return
 
-    # Обычные сообщения сохраняем в историю и проверяем,
-    # не является ли сообщение анкетой.
+    author_id = user.id if user else 0
+    author_name = user.full_name if user else "Неизвестный автор"
+
+    # Обычные сообщения: запоминаем текст и обнаруживаем анкеты.
     if not text.lower().startswith("макии"):
-        chat_history[scope].append({
-            "role": "user",
-            "content": text[:4000],
-        })
-
-        if looks_like_sheet(text):
-            user = message.from_user
-
-            author_id = user.id if user else 0
-
-            author_name = (
-                user.full_name if user else "Неизвестный автор"
+        if user:
+            await asyncio.to_thread(
+                save_user_memory,
+                chat_id,
+                author_id,
+                f"Сообщение от {author_name}: {text[:1500]}",
             )
 
+        if looks_like_sheet(text):
             save_sheet(
-                chat_id=chat_id,
-                topic_id=topic_id,
-                author_id=author_id,
-                author_name=author_name,
-                text=text,
+                chat_id,
+                topic_id,
+                author_id,
+                author_name,
+                text,
             )
 
         return
 
-    # Удаляем триггер «макии».
     command = text[len("макии"):].strip()
     command_lower = command.lower()
 
     if not command:
-        await message.answer(
-            "Йо! Что делаем, бро?"
-        )
+        await message.answer("Йо, бро 😎")
         return
 
-    user = message.from_user
-    requester_id = user.id if user else None
+    # Память участников используется в обычных ответах.
+    chat_memory = await asyncio.to_thread(
+        load_chat_memories,
+        chat_id,
+    )
 
     # --------------------------------------------------------
-    # МАКИИ НАЙДИ АНКЕТУ [ИМЯ ИЛИ ЧАСТЬ ТЕКСТА]
+    # ПОИСК АНКЕТЫ
     # --------------------------------------------------------
 
     if command_lower.startswith("найди анкету"):
         query = command[len("найди анкету"):].strip()
 
         sheet = find_sheet(
-            chat_id=chat_id,
-            topic_id=topic_id,
-            query=query,
-            requester_id=requester_id,
+            chat_id,
+            topic_id,
+            query,
+            author_id,
         )
 
         if sheet is None:
             await message.answer(
-                "Не нашёл такую анкету в сохранённых сообщениях. "
-                "Проверь имя или отправь анкету ещё раз."
+                "Бро, не нашёл эту анкету в памяти. "
+                "Пока анкеты хранятся до перезапуска бота."
             )
             return
 
-        result = (
-            f"Нашёл анкету!\n"
-            f"Автор: {sheet['author_name']}\n\n"
-            f"{sheet['text']}"
+        await send_long_message(
+            message,
+            f"Нашёл анкету!\nАвтор: {sheet['author_name']}\n\n"
+            f"{sheet['text']}",
         )
-
-        await send_long_message(message, result)
         return
 
     # --------------------------------------------------------
-    # МАКИИ ПРОВЕРЬ [АНКЕТУ]
+    # ПРОВЕРКА АНКЕТЫ
     # --------------------------------------------------------
 
     if command_lower.startswith("проверь"):
         sheet_text = ""
 
-        # Если команда является ответом на сообщение,
-        # сначала проверяем текст того сообщения.
         replied = message.reply_to_message
 
         if replied:
             sheet_text = (
-                replied.text
-                or replied.caption
-                or ""
+                replied.text or replied.caption or ""
             ).strip()
 
-        # Если ответа на сообщение нет, ищем анкету.
         if not sheet_text:
             query = command[len("проверь"):].strip()
-
             sheet = find_sheet(
-                chat_id=chat_id,
-                topic_id=topic_id,
-                query=query,
-                requester_id=requester_id,
+                chat_id,
+                topic_id,
+                query,
+                author_id,
             )
 
             if sheet:
@@ -778,15 +802,12 @@ async def handle_messages(message: Message):
 
         if not sheet_text or len(sheet_text) < 20:
             await message.answer(
-                "Бро, не вижу анкету для проверки. "
-                "Ответь на сообщение с анкетой командой "
-                "«макии проверь» или сначала отправь анкету."
+                "Бро, не вижу анкету. Ответь на сообщение с анкетой "
+                "командой «макии проверь»."
             )
             return
 
-        await message.answer(
-            "Проверяю анкету, бро..."
-        )
+        await message.answer("Ща проверю, бро...")
 
         rules = await asyncio.to_thread(
             get_knowledge_context,
@@ -794,59 +815,40 @@ async def handle_messages(message: Message):
             True,
         )
 
-        messages = [
+        answer = await ask_ai([
             {
                 "role": "system",
-                "content": (
-                    MAK_PERSONA
-                    + "\n\n"
-                    + CHECK_PROMPT
-                    + "\n\nПРАВИЛА ИЗ БАЗЫ ЗНАНИЙ:\n"
-                    + rules
-                ),
+                "content": MAK_PERSONA + "\n\n" + CHECK_PROMPT
+                + "\n\nПРАВИЛА ИЗ БАЗЫ ЗНАНИЙ:\n" + rules,
             },
             {
                 "role": "user",
-                "content": (
-                    "Проверь именно эту анкету. "
-                    "Не меняй значения характеристик.\n\n"
-                    + sheet_text
-                ),
+                "content": "Проверь анкету, не меняя исходные значения:\n\n"
+                + sheet_text,
             },
-        ]
-
-        answer = await ask_ai(
-            messages,
-            model=SMART_MODEL,
-        )
+        ], model=SMART_MODEL)
 
         await send_long_message(message, answer)
         return
 
     # --------------------------------------------------------
-    # МАКИИ НАЙДИ [ПОИСК В ИНТЕРНЕТЕ]
+    # ПОИСК В ИНТЕРНЕТЕ
     # --------------------------------------------------------
 
     if command_lower.startswith("найди"):
         query = command[len("найди"):].strip()
 
         if not query:
-            await message.answer(
-                "Что именно поискать в интернете?"
-            )
+            await message.answer("Что ищем, бро?")
             return
 
-        await message.answer(
-            "Ща поищу..."
-        )
-
+        await message.answer("Ща поищу...")
         answer = await answer_from_web(query)
-
         await send_long_message(message, answer)
         return
 
     # --------------------------------------------------------
-    # ОБЫЧНЫЙ ДИАЛОГ С МАКОМ
+    # ОБЫЧНЫЙ ДИАЛОГ
     # --------------------------------------------------------
 
     rules = ""
@@ -858,45 +860,54 @@ async def handle_messages(message: Message):
             False,
         )
 
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                MAK_PERSONA
-                + (
-                    "\n\nРЕЛЕВАНТНЫЕ ПРАВИЛА RP:\n" + rules
-                    if rules else ""
-                )
-            ),
-        }
-    ]
+    system_text = MAK_PERSONA
 
-    # Добавляем историю диалога.
+    if chat_memory:
+        system_text += (
+            "\n\nПАМЯТЬ ОБ УЧАСТНИКАХ ЭТОГО ЧАТА:\n"
+            + chat_memory
+            + "\n\nИспользуй память, если спрашивают об участниках. "
+            "Не путай людей и не выдумывай факты."
+        )
+
+    if rules:
+        system_text += "\n\nРЕЛЕВАНТНЫЕ ПРАВИЛА RP:\n" + rules
+
+    messages = [{"role": "system", "content": system_text}]
     messages.extend(list(chat_history[scope]))
-
-    # Добавляем текущий запрос.
     messages.append({
         "role": "user",
-        "content": command,
+        "content": f"{author_name} (Telegram ID {author_id}): {command}",
     })
 
     answer = await ask_ai(messages)
 
     chat_history[scope].append({
         "role": "user",
-        "content": command[:4000],
+        "content": f"{author_name}: {command[:1500]}",
     })
-
     chat_history[scope].append({
         "role": "assistant",
-        "content": answer[:4000],
+        "content": answer[:2500],
     })
+
+    # Сохраняем вопрос и ответ в долговременную память.
+    await asyncio.to_thread(
+        save_user_memory,
+        chat_id,
+        author_id,
+        f"Чел ({author_name}): {command[:1500]}\n"
+        f"ИИ (МАК): {answer[:2500]}",
+    )
 
     await send_long_message(message, answer)
 
+    # Стикер отправляется иногда, а не после каждого ответа.
+    await maybe_send_sticker(message, answer)
+
 
 # ============================================================
-# HTTP-СЕРВЕР ДЛЯ RENDER
+# HTTP-СЕРВЕР RENDER
 # ============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -919,7 +930,6 @@ def start_health_server():
     )
 
     logging.info("HTTP health server запущен на порту %s", port)
-
     server.serve_forever()
 
 
@@ -934,10 +944,7 @@ async def main():
     ).start()
 
     logging.info("МАК запускается...")
-
-    # Удаляем старый webhook, чтобы polling мог работать.
     await bot.delete_webhook(drop_pending_updates=False)
-
     await dp.start_polling(bot)
 
 
