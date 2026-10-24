@@ -9,29 +9,34 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import requests
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
+from ddgs import DDGS
+from supabase import create_client
+
 
 # ================= НАСТРОЙКИ =================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 
-# Экономичная модель для обычного общения
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_ROLE_KEY = os.getenv(
+    "SUPABASE_SERVICE_ROLE_KEY", ""
+).strip()
+
 CHAT_MODEL = os.getenv(
-    "CHAT_MODEL", "gemini-3.5-flash-lite"
+    "CHAT_MODEL", "openai/gpt-oss-20b"
 )
-
-# Модель для анкет и проверки баланса
 SMART_MODEL = os.getenv(
-    "SMART_MODEL", "gemini-3.6-flash"
+    "SMART_MODEL", "openai/gpt-oss-20b"
 )
 
-API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Не задан TELEGRAM_TOKEN")
 
-if not GEMINI_API_KEY:
-    raise RuntimeError("Не задан GEMINI_API_KEY")
+if not GROQ_API_KEY:
+    raise RuntimeError("Не задан GROQ_API_KEY")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("MAK")
@@ -42,11 +47,26 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# История отдельно для каждого чата, максимум 30 сообщений
+# История отдельно для каждого чата и каждой темы форума.
 chat_history = defaultdict(lambda: deque(maxlen=30))
 
+# Supabase необязателен для запуска бота, но нужен для правил RP.
+supabase = None
 
-# ================= WEB-СЕРВЕР =================
+if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+    try:
+        supabase = create_client(
+            SUPABASE_URL,
+            SUPABASE_SERVICE_ROLE_KEY,
+        )
+        log.info("Supabase configured")
+    except Exception:
+        log.exception("Supabase initialization failed")
+else:
+    log.warning("Supabase credentials missing; database disabled")
+
+
+# ================= WEB-СЕРВЕР RENDER =================
 
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -73,91 +93,208 @@ threading.Thread(
 ).start()
 
 
-# ================= GEMINI API =================
+# ================= GROQ ИИ =================
 
-async def ask_gemini(system_prompt, user_prompt, model=CHAT_MODEL):
-    url = f"{API_URL}/{model}:generateContent"
-
+async def ask_ai(system_prompt, user_prompt, model=CHAT_MODEL):
     payload = {
-        "system_instruction": {
-            "parts": [{"text": system_prompt}]
-        },
-        "contents": [{
-            "role": "user",
-            "parts": [{"text": user_prompt}]
-        }],
-        "generationConfig": {
-            "temperature": 0.8,
-            "maxOutputTokens": 1800,
-        },
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 1800,
     }
 
     try:
         response = await asyncio.to_thread(
             requests.post,
-            url,
-            params={"key": GEMINI_API_KEY},
+            GROQ_URL,
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
             json=payload,
             timeout=45,
         )
 
         if response.status_code != 200:
             log.error(
-                "Gemini API error: %s %s",
+                "Groq error: HTTP %s: %s",
                 response.status_code,
-                response.text[:1000],
+                response.text[:800],
             )
 
             if response.status_code == 429:
-                return "Бро, упёрлись в лимит Gemini 💀 Подожди немного и попробуй ещё раз."
-
-            if response.status_code in (401, 403):
-                return "Бро, Gemini отклонил доступ. Проверь API-ключ и доступ к модели."
-
-            if response.status_code == 404:
                 return (
-                    f"Модель {model} не найдена или недоступна "
-                    "для этого проекта. Проверь её в Google AI Studio."
+                    "Бро, мы упёрлись в лимит Groq 💀 "
+                    "Подожди немного и попробуй снова."
                 )
 
-            return f"Ошибка Gemini API: HTTP {response.status_code}"
+            if response.status_code in (401, 403):
+                return (
+                    "Бро, Groq отклонил доступ. "
+                    "Проверь GROQ_API_KEY в Render."
+                )
+
+            return f"Ошибка Groq API: HTTP {response.status_code}"
 
         data = response.json()
-        candidates = data.get("candidates", [])
+        choices = data.get("choices", [])
 
-        if not candidates:
-            feedback = data.get("promptFeedback", {})
-            log.warning("Gemini returned no candidates: %s", feedback)
-            return "Бро, Gemini не выдал ответ. Попробуй переформулировать запрос."
+        if not choices:
+            return "Бро, ИИ не выдал ответ. Попробуй ещё раз."
 
-        candidate = candidates[0]
-        parts = candidate.get("content", {}).get("parts", [])
-        answer = "\n".join(
-            part["text"]
-            for part in parts
-            if "text" in part
+        answer = (
+            choices[0].get("message", {}).get("content") or ""
         ).strip()
 
-        if not answer:
-            return "Бро, Gemini вернул пустой ответ. Попробуй ещё раз."
-
-        return answer
+        return answer or "Бро, ИИ вернул пустой ответ."
 
     except requests.Timeout:
-        return "Бро, Gemini слишком долго отвечает. Попробуй ещё раз."
+        return "Бро, ИИ долго отвечает. Попробуй ещё раз."
     except requests.RequestException:
-        log.exception("Gemini connection error")
-        return "Бро, не удалось подключиться к Gemini."
+        log.exception("Groq connection error")
+        return "Бро, не удалось подключиться к Groq."
     except (ValueError, KeyError, TypeError):
-        log.exception("Invalid Gemini response")
-        return "Бро, пришёл ответ неожиданного формата от Gemini."
+        log.exception("Invalid Groq response")
+        return "Бро, пришёл ответ неожиданного формата."
+
+
+# ================= ПОИСК ПРАВИЛ В SUPABASE =================
+
+def load_knowledge():
+    if supabase is None:
+        return []
+
+    try:
+        result = (
+            supabase.table("rp_knowledge")
+            .select("title,content")
+            .limit(100)
+            .execute()
+        )
+        return result.data or []
+    except Exception:
+        log.exception("Supabase knowledge query failed")
+        return []
+
+
+def get_knowledge_context(query):
+    rows = load_knowledge()
+
+    if not rows:
+        return ""
+
+    # Выбираем правила, совпадающие с запросом.
+    words = {
+        word.casefold()
+        for word in query.split()
+        if len(word) >= 3
+    }
+
+    ranked = []
+
+    for row in rows:
+        title = str(row.get("title", ""))
+        content = str(row.get("content", ""))
+        combined = f"{title} {content}"
+
+        score = sum(
+            1 for word in words if word in combined.casefold()
+        )
+
+        ranked.append((score, title, content))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+
+    # При небольшом числе правил передаём все;
+    # иначе — только несколько наиболее подходящих.
+    selected = [
+        item for item in ranked if item[0] > 0
+    ][:6]
+
+    if not selected:
+        selected = ranked[:4]
+
+    return "\n\n".join(
+        f"Правило: {title}\n{content}"
+        for _, title, content in selected
+    )
+
+
+# ================= ИНТЕРНЕТ-ПОИСК =================
+
+def search_web_sync(query):
+    results = []
+
+    with DDGS() as ddgs:
+        for item in ddgs.text(query, max_results=6):
+            results.append({
+                "title": item.get("title", "Без названия"),
+                "url": item.get("href", ""),
+                "body": item.get("body", ""),
+            })
+
+    return results
+
+
+async def search_web(query):
+    try:
+        return await asyncio.to_thread(search_web_sync, query)
+    except Exception:
+        log.exception("Internet search failed")
+        return []
+
+
+async def answer_from_web(query):
+    results = await search_web(query)
+
+    if not results:
+        return (
+            "Бро, сейчас не получилось найти результаты в интернете. "
+            "Попробуй ещё раз немного позже."
+        )
+
+    formatted_sources = []
+
+    for index, item in enumerate(results, start=1):
+        formatted_sources.append(
+            f"[{index}] {item['title']}\n"
+            f"URL: {item['url']}\n"
+            f"Описание: {item['body']}"
+        )
+
+    sources_text = "\n\n".join(formatted_sources)
+
+    system_prompt = (
+        MAK_PERSONA
+        + "\nТы отвечаешь на основе результатов интернет-поиска. "
+        "Отделяй найденные сведения от предположений. "
+        "Не утверждай, что источник подтверждает то, чего в нём нет. "
+        "Если результаты противоречат друг другу, сообщи об этом. "
+        "В конце добавь раздел «Источники» со ссылками из результатов. "
+        "Не придумывай URL."
+    )
+
+    prompt = (
+        f"Запрос пользователя: {query}\n\n"
+        f"Результаты интернет-поиска:\n{sources_text}\n\n"
+        "Ответь по-русски, кратко и полезно. "
+        "Используй найденные ссылки в разделе источников."
+    )
+
+    answer = await ask_ai(system_prompt, prompt, SMART_MODEL)
+
+    if answer.startswith("Ошибка Groq API:"):
+        return answer
+
+    return answer
 
 
 # ================= ОТПРАВКА ОТВЕТОВ =================
 
 async def send_long_message(message, text):
-    # Лимит Telegram — 4096 символов на сообщение.
-    # Разбиваем чуть раньше, стараясь сохранить абзацы.
     while text:
         if len(text) <= 4000:
             chunk, text = text, ""
@@ -165,66 +302,24 @@ async def send_long_message(message, text):
             split_at = text.rfind("\n", 0, 4000)
             if split_at < 1000:
                 split_at = 4000
-            chunk, text = text[:split_at], text[split_at:].lstrip()
+
+            chunk = text[:split_at]
+            text = text[split_at:].lstrip()
 
         await message.answer(chunk)
 
 
-# ================= ПРОМПТЫ =================
+# ================= ХАРАКТЕР МАКА =================
 
 MAK_PERSONA = (
     "Ты МАК — умный, весёлый и дружелюбный бро. "
     "Общайся по-русски, неформально, используй уместный сленг, "
-    "юмор и эмодзи. Отвечай точно. Девиз: "
-    "'Сначала разберёмся, потом сделаем имбу'."
+    "юмор и эмодзи. Не жертвуй точностью ради шутки. "
+    "Девиз: «Сначала разберёмся, потом сделаем имбу»."
 )
 
-CHARACTER_PROMPT = MAK_PERSONA + """
-Создай анкету персонажа для Dandy's World RP.
-Учитывай историю чата, если она передана. Не выдумывай
-реальные факты об участниках без оснований.
 
-Правила:
-1. Кто вы: любое существо, тун или монстр.
-2. Возраст и адекватный рост обязательны.
-3. Характер соответствует описанию или общению.
-4. Друзей указывай только если есть основания.
-5. Выбери тип: Тун, Мейн или Летальный.
-6. Сумма пяти характеристик без ХП:
-   Тун — строго 15 звёзд;
-   Мейн — строго 16 звёзд;
-   Летальный — строго 16 звёзд.
-7. Скилл чек, скорость, выносливость, скрытность,
-   экстракт: каждая характеристика от 1 до 5 звёзд.
-8. ХП — от 1 до 4 сердец.
-9. КД способности: Тун 60–100 сек.;
-   Мейн 80–200 сек. Для Летального предложи разумный КД.
-10. Выносливость: 1 звезда = 100 стамины;
-    каждая следующая звезда добавляет 25% от 100;
-    5 звёзд = 200 стамины.
-11. Способность должна быть интересной, но не всемогущей.
-
-Проверь сумму звёзд перед выдачей анкеты.
-
-Формат:
-🔥 АНКЕТА ПЕРСОНАЖА ОТ МАКа 🔥
-👤 Имя / Кто вы:
-🎂 Возраст:
-📏 Рост:
-🎭 Характер:
-🤝 Друзья / С кем ладит:
-🏷️ Тип:
-⚡ Способность / Пассивка: (КД: ... сек)
-📊 Характеристики (Всего звёзд: X/15 или X/16):
-- ❤️ ХП: X/4 сердца
-- 🎯 Скилл чек: X/5
-- ⚡ Скорость: X/5
-- 🏃 Выносливость: X/5 (X стамины)
-- 👤 Скрытность: X/5
-- 🛠️ Скорость экстракта: X/5
-🎨 Внешность туна:
-💬 Комментарий МАКа:
-"""
+# ================= ПРОВЕРКА АНКЕТ =================
 
 CHECK_PROMPT = MAK_PERSONA + """
 Ты эксперт по балансу анкет Dandy's World RP.
@@ -259,83 +354,147 @@ async def handle_messages(message: types.Message):
     if not text or not message.from_user:
         return
 
-    text_lower = text.lower()
+    text_lower = text.casefold()
     chat_id = message.chat.id
+    topic_id = message.message_thread_id or 0
+    history_key = (chat_id, topic_id)
+
     author = message.from_user.first_name or "Участник"
 
-    # Обычные сообщения только сохраняются для контекста.
+    # Сохраняем сообщения для контекста,
+    # но бот не отвечает на каждое сообщение.
     if not text_lower.startswith("макии"):
-        chat_history[chat_id].append(f"{author}: {text[:1500]}")
+        chat_history[history_key].append(
+            f"{author}: {text[:1500]}"
+        )
         return
 
-    # Убираем триггер "макии" и пробелы.
     command = text[5:].strip()
-    command_lower = command.lower()
+    command_lower = command.casefold()
 
+    # «МАКИИ найди» теперь выполняет интернет-поиск.
     if command_lower.startswith("найди"):
-        query = command[5:].strip() or "придумай персонажа"
+        query = command[5:].strip()
 
-        history = "\n".join(chat_history[chat_id])
-        if len(history) > 8000:
-            history = history[-8000:]
+        if not query:
+            await message.reply(
+                "Бро, что именно ищем? Например: "
+                "«макии найди способности Astro Dandy's World»."
+            )
+            return
 
-        prompt = (
-            f"Запрос: {query[:2000]}\n\n"
-            f"История чата:\n{history or 'Чат пока пуст.'}"
+        status = await message.reply(
+            "🌐 Ищу в интернете, бро..."
         )
 
-        status = await message.reply("🔍 МАК собирает анкету, бро...")
-        result = await ask_gemini(
-            CHARACTER_PROMPT,
-            prompt,
-            SMART_MODEL,
-        )
+        try:
+            result = await answer_from_web(query)
+        except Exception:
+            log.exception("Web answer failed")
+            result = (
+                "Бро, при поиске что-то сломалось. "
+                "Попробуй ещё раз позже."
+            )
 
-        await status.delete()
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
         await send_long_message(message, result)
         return
 
+    # Проверка анкеты.
     if command_lower.startswith("проверь"):
         query = command[7:].strip()
 
         if message.reply_to_message:
-            replied_text = message.reply_to_message.text or ""
+            replied_text = (
+                message.reply_to_message.text
+                or message.reply_to_message.caption
+                or ""
+            )
+
             if replied_text:
-                query = f"{query}\n\nАнкета из сообщения:\n{replied_text}"
+                query = (
+                    f"{query}\n\n"
+                    f"Анкета из сообщения:\n{replied_text}"
+                )
 
         if not query:
             await message.reply(
-                "Бро, напиши анкету после «МакИИ проверь» "
-                "или ответь реплаем на сообщение с анкетой!"
+                "Бро, напиши анкету после «макии проверь» "
+                "или ответь на сообщение с анкетой!"
             )
             return
 
-        status = await message.reply("🧐 МАК проверяет баланс...")
-        result = await ask_gemini(
+        rules = await asyncio.to_thread(
+            get_knowledge_context, query
+        )
+
+        prompt = f"Анкета для проверки:\n{query[:12000]}"
+
+        if rules:
+            prompt += (
+                "\n\nПравила RP из базы данных Supabase:\n"
+                f"{rules}"
+            )
+
+        status = await message.reply(
+            "🧐 МАК проверяет баланс..."
+        )
+
+        result = await ask_ai(
             CHECK_PROMPT,
-            query[:12000],
+            prompt,
             SMART_MODEL,
         )
 
-        await status.delete()
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
         await send_long_message(message, result)
         return
 
+    # Обычное общение.
     user_query = command or "Йо, бро, ты тут?"
 
-    result = await ask_gemini(
+    history = "\n".join(chat_history[history_key])
+
+    if len(history) > 6000:
+        history = history[-6000:]
+
+    rules = await asyncio.to_thread(
+        get_knowledge_context, user_query
+    )
+
+    prompt = f"Сообщение пользователя: {user_query[:6000]}"
+
+    if history:
+        prompt += f"\n\nНедавняя история этой темы:\n{history}"
+
+    if rules:
+        prompt += (
+            "\n\nПолезные правила RP из Supabase:\n"
+            f"{rules}"
+        )
+
+    result = await ask_ai(
         MAK_PERSONA,
-        user_query[:8000],
+        prompt,
         CHAT_MODEL,
     )
 
     await send_long_message(message, result)
 
 
+# ================= ЗАПУСК =================
+
 async def main():
     log.info("Starting MAK bot")
 
-    # Удаляем старый webhook для polling.
     await bot.delete_webhook(drop_pending_updates=True)
 
     try:
